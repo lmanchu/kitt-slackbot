@@ -22,7 +22,7 @@ const app = new App({
 
 // Use local Ollama instead of Gemini API (no quota limits, faster response)
 const OLLAMA_API = 'http://localhost:11434/api/generate';
-const OLLAMA_MODEL = 'qwen3-vl:4b'; // 4B parameter model for balanced speed/quality
+const OLLAMA_MODEL = 'gpt-oss:20b'; // 20B parameter model for high-quality responses
 
 // ============ KNOWLEDGE BASE SYSTEM ============
 
