@@ -48,6 +48,71 @@ let knowledgeBase = {
   lastUpdated: null
 };
 
+// ============ CONVERSATION MEMORY ============
+
+// Store conversation history per user (userId -> messages array)
+const conversationHistory = new Map();
+const CONVERSATION_MAX_MESSAGES = 10; // Keep last N message pairs
+const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Add a message to conversation history
+ */
+function addToConversation(userId, role, content) {
+  if (!conversationHistory.has(userId)) {
+    conversationHistory.set(userId, {
+      messages: [],
+      lastActivity: Date.now()
+    });
+  }
+
+  const userConvo = conversationHistory.get(userId);
+  userConvo.messages.push({ role, content, timestamp: Date.now() });
+  userConvo.lastActivity = Date.now();
+
+  // Trim to max messages (keep pairs: user + assistant)
+  while (userConvo.messages.length > CONVERSATION_MAX_MESSAGES * 2) {
+    userConvo.messages.shift();
+  }
+}
+
+/**
+ * Get conversation history for a user
+ */
+function getConversationHistory(userId) {
+  const userConvo = conversationHistory.get(userId);
+  if (!userConvo) return [];
+
+  // Check if conversation expired
+  if (Date.now() - userConvo.lastActivity > CONVERSATION_TIMEOUT_MS) {
+    conversationHistory.delete(userId);
+    return [];
+  }
+
+  return userConvo.messages;
+}
+
+/**
+ * Clear conversation history for a user
+ */
+function clearConversation(userId) {
+  conversationHistory.delete(userId);
+}
+
+/**
+ * Format conversation history for prompt
+ */
+function formatConversationForPrompt(history) {
+  if (!history || history.length === 0) return '';
+
+  const formatted = history.map(msg => {
+    const role = msg.role === 'user' ? '用戶' : 'KITT';
+    return `${role}: ${msg.content}`;
+  }).join('\n');
+
+  return `\n\n## 最近對話記錄:\n${formatted}\n`;
+}
+
 /**
  * Load all knowledge base files into memory
  */
@@ -560,6 +625,11 @@ async function generateAIResponse(userMessage, userLang, context = {}) {
     const productInfo = knowledgeBase.product ? `\n\nProduct Details:\n${knowledgeBase.product.substring(0, 3000)}` : '';
     const currentPriorities = knowledgeBase.priorities ? `\n\nCurrent Priorities:\n${knowledgeBase.priorities.substring(0, 1000)}` : '';
 
+    // Get conversation history if userId is provided
+    const conversationContext = context.userId
+      ? formatConversationForPrompt(getConversationHistory(context.userId))
+      : '';
+
     const systemPrompt = `You are KITT (Knight Industries Team Tool), an advanced AI assistant in a Slack workspace for IrisGo.AI team.
 
 Your personality:
@@ -567,18 +637,23 @@ Your personality:
 - Slightly sophisticated but friendly
 - Always ready to assist with team collaboration
 - Multilingual capabilities (speak the user's language naturally)
+- You remember recent conversations and can refer back to them
 
 About IrisGo.AI (Updated: ${knowledgeBase.lastUpdated || 'N/A'}):
 ${productInfo || '- IrisGo is a Personal AI Assistant product (B2C consumer product)\n- Privacy-first, on-device AI solution\n- Helps users manage knowledge, tasks, and daily workflows\n- Uses local AI models for maximum privacy\n- While the product is B2C, we explore B2B distribution channels (e.g., OEM partnerships with PC manufacturers)\n- NOT an enterprise B2B SaaS service'}
 ${currentPriorities}
-
+${conversationContext}
 Context:
 - User's language: ${userLang}
-- User's message: ${userMessage}
+- Current message: ${userMessage}
 ${context.teamMembers ? `- Team members: ${context.teamMembers.join(', ')}` : ''}
 ${context.channel ? `- Channel: ${context.channel}` : ''}
 
-Respond naturally in the user's language (${userLang}). Be concise, helpful, and professional.`;
+Instructions:
+- If there's conversation history, use it to understand the context of the current message
+- Respond naturally in the user's language (${userLang})
+- Be concise, helpful, and professional
+- If the user refers to something from earlier in the conversation, acknowledge it`;
 
     const result = await callOllama(systemPrompt, 500);
     return result.trim();
@@ -1533,12 +1608,24 @@ app.event('message', async ({ event, say, client }) => {
 
         await say(ackMessage);
       } else {
-        // Regular query → normal AI response
+        // Regular query → normal AI response with conversation context
         console.log(`[DEBUG] Entering regular query path...`);
         const userLang = await detectLanguage(event.text);
         console.log(`[DEBUG] Detected language: ${userLang}`);
-        const response = await generateAIResponse(event.text, userLang);
+
+        // Save user message to conversation history
+        addToConversation(event.user, 'user', event.text);
+
+        // Generate response with conversation context
+        const response = await generateAIResponse(event.text, userLang, {
+          userId: event.user,
+          channel: event.channel
+        });
         console.log(`[DEBUG] AI response generated, length: ${response?.length || 0}`);
+
+        // Save KITT response to conversation history
+        addToConversation(event.user, 'assistant', response);
+
         await say(response);
         console.log(`[DEBUG] Response sent via say()`);
       }
