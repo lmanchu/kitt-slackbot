@@ -504,28 +504,23 @@ async function callOllama(prompt, maxTokens = 300) {
  */
 async function detectLanguage(text) {
   try {
-    const prompt = `What language is this text? Reply with ONLY ONE of these codes: zh-TW, zh-CN, en, ja, ko, es, fr, de
+    // FAST PATH: Use regex for reliable detection (AI model has issues)
 
-Text: "${text}"
-
-ONE CODE ONLY:`;
-
-    const result = await callOllama(prompt, 20);
-    const cleaned = result.trim().toLowerCase();
-
-    // Extract valid language code from response
-    const validCodes = ['zh-tw', 'zh-cn', 'en', 'ja', 'ko', 'es', 'fr', 'de'];
-    for (const code of validCodes) {
-      if (cleaned.includes(code)) {
-        return code === 'zh-tw' ? 'zh-TW' : code === 'zh-cn' ? 'zh-CN' : code;
-      }
+    // Japanese: Hiragana or Katakana
+    if (/[\u3040-\u309f\u30a0-\u30ff]/.test(text)) {
+      return 'ja';
     }
 
-    // Fallback: detect Chinese and distinguish Simplified vs Traditional
+    // Korean: Hangul
+    if (/[\uac00-\ud7af\u1100-\u11ff]/.test(text)) {
+      return 'ko';
+    }
+
+    // Chinese: CJK characters (check after Japanese since Japanese also uses some CJK)
     if (/[\u4e00-\u9fff]/.test(text)) {
-      // Common Simplified Chinese specific characters (not used in Traditional)
-      const simplifiedChars = /[这这个们会说对没关机开时为么什让给从远进还边]/;
-      // Common Traditional Chinese specific characters (not used in Simplified)
+      // Common Simplified Chinese specific characters
+      const simplifiedChars = /[这个们会说对没关机开时为么什让给从远进还边]/;
+      // Common Traditional Chinese specific characters
       const traditionalChars = /[這個們會說對沒關機開時為麼什讓給從遠進還邊]/;
 
       const hasSimplified = simplifiedChars.test(text);
@@ -537,6 +532,7 @@ ONE CODE ONLY:`;
       return 'zh-TW';
     }
 
+    // Default to English
     return 'en';
   } catch (error) {
     console.error('Language detection error:', error.message);
