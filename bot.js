@@ -25,10 +25,10 @@ const app = new App({
   port: process.env.PORT || 3000
 });
 
-// Use local Ollama instead of Gemini API (no quota limits, faster response)
+// AI Provider Configuration (fallback hierarchy: Gemini → OpenAI → Ollama)
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OLLAMA_API = 'http://localhost:11434/api/generate';
-// Note: gpt-oss:20b has issues (puts answers in thinking field, not response)
-// Using qwen2.5:3b which properly returns response field
 const OLLAMA_MODEL = 'qwen2.5:3b';
 
 // ============ KNOWLEDGE BASE SYSTEM ============
@@ -149,7 +149,7 @@ Reply with ONLY one word:
 
 Answer:`;
 
-    const result = await callOllama(prompt, 10);
+    const result = await callAI(prompt, 10);
     const answer = result.trim().toUpperCase();
     console.log(`[DEBUG] LLM intent detection result: "${answer}" for text: "${text.substring(0, 50)}..."`);
     return answer.includes('YES');
@@ -426,77 +426,116 @@ function applyUpdate(update) {
 // ============ AI HELPERS ============
 
 /**
+ * Call Gemini API (free tier)
+ */
+async function callGemini(prompt, maxTokens = 300) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not configured');
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: maxTokens,
+        }
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Gemini API error: ${response.status} - ${error}`);
+  }
+
+  const data = await response.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+}
+
+/**
+ * Call OpenAI API
+ */
+async function callOpenAI(prompt, maxTokens = 300) {
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not configured');
+
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: maxTokens,
+      temperature: 0.3
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+  }
+
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content?.trim() || '';
+}
+
+/**
  * Call local Ollama API
+ */
+async function callOllama(prompt, maxTokens = 300) {
+  const response = await fetch(OLLAMA_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: OLLAMA_MODEL,
+      prompt: prompt,
+      stream: false,
+      options: { temperature: 0.3, num_predict: maxTokens, top_p: 0.9 }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Ollama API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return (data.response || '').trim();
+}
+
+/**
+ * Unified AI call with fallback hierarchy: Gemini → OpenAI → Ollama
  * @param {string} prompt - Prompt for the model
  * @param {number} maxTokens - Maximum tokens to generate
  * @returns {Promise<string>} - Generated text
  */
-async function callOllama(prompt, maxTokens = 300) {
-  try {
-    const response = await fetch(OLLAMA_API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt: prompt,
-        stream: false,
-        options: {
-          temperature: 0.3,
-          num_predict: maxTokens,
-          top_p: 0.9
-        }
-      })
-    });
+async function callAI(prompt, maxTokens = 300) {
+  const providers = [
+    { name: 'Gemini', fn: callGemini, enabled: !!GEMINI_API_KEY },
+    { name: 'OpenAI', fn: callOpenAI, enabled: !!OPENAI_API_KEY },
+    { name: 'Ollama', fn: callOllama, enabled: true }
+  ];
 
-    if (!response.ok) {
-      throw new Error(`Ollama API error: ${response.status}`);
-    }
+  for (const provider of providers) {
+    if (!provider.enabled) continue;
 
-    const data = await response.json();
-
-    // Handle gpt-oss model that puts answers in thinking instead of response
-    if (data.response && data.response.trim()) {
-      return data.response.trim();
-    }
-
-    // If response is empty but thinking exists, extract usable content
-    if (data.thinking && data.thinking.trim()) {
-      const thinking = data.thinking.trim();
-
-      // Try to find quoted answer patterns like "答案是..." or final statements
-      const patterns = [
-        /(?:So (?:I'll|we) (?:say|respond|answer)[:\s]+)["']?([^"'\n]+)["']?/i,
-        /(?:回答|答案|回覆)[：:\s]+["']?([^"'\n]+)["']?/,
-        /(?:Let's (?:say|respond))[:\s]+["']?([^"'\n]+)["']?/i,
-      ];
-
-      for (const pattern of patterns) {
-        const match = thinking.match(pattern);
-        if (match && match[1] && match[1].length > 10) {
-          return match[1].trim();
-        }
+    try {
+      console.log(`[AI] Trying ${provider.name}...`);
+      const result = await provider.fn(prompt, maxTokens);
+      if (result) {
+        console.log(`[AI] ${provider.name} succeeded`);
+        return result;
       }
-
-      // Fallback: Get the last meaningful paragraph (likely the conclusion)
-      const paragraphs = thinking.split(/\n\n+/).filter(p => p.trim().length > 20);
-      if (paragraphs.length > 0) {
-        const lastParagraph = paragraphs[paragraphs.length - 1].trim();
-        // If last paragraph looks like a conclusion, use it
-        if (lastParagraph.length < 500) {
-          return lastParagraph;
-        }
-      }
-
-      // Last resort: Return truncated thinking with warning
-      console.warn('[Ollama] Using raw thinking output - response was empty');
-      return thinking.substring(0, 500) + (thinking.length > 500 ? '...' : '');
+    } catch (error) {
+      console.warn(`[AI] ${provider.name} failed: ${error.message}`);
     }
-
-    return '';
-  } catch (error) {
-    console.error('Ollama API error:', error.message);
-    throw error;
   }
+
+  throw new Error('All AI providers failed');
 }
 
 /**
@@ -554,7 +593,7 @@ async function translateText(text, targetLang) {
 
 ${text}`;
 
-    const result = await callOllama(prompt, 500);
+    const result = await callAI(prompt, 500);
     return result.trim();
   } catch (error) {
     console.error('Translation error:', error.message);
@@ -608,7 +647,7 @@ Instructions:
 
 Your response (in ${userLang}):`;
 
-    const result = await callOllama(systemPrompt, 500);
+    const result = await callAI(systemPrompt, 500);
     return result.trim();
   } catch (error) {
     console.error('AI response error:', error.message);
