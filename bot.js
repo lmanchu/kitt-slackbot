@@ -11,6 +11,11 @@ const { App } = require('@slack/bolt');
 const fs = require('fs');
 const path = require('path');
 
+// SQLite Storage Modules
+const { initDB, getStats: getDBStats } = require('./storage/database');
+const { addMessage, getHistory, clearHistory, formatForPrompt, cleanupExpired } = require('./storage/conversations');
+const { createUpdate, getUpdate, getPendingUpdates, getAllUpdates, updateStatus, editUpdate } = require('./storage/updates');
+
 // Initialize Slack App
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -48,70 +53,9 @@ let knowledgeBase = {
   lastUpdated: null
 };
 
-// ============ CONVERSATION MEMORY ============
-
-// Store conversation history per user (userId -> messages array)
-const conversationHistory = new Map();
-const CONVERSATION_MAX_MESSAGES = 10; // Keep last N message pairs
-const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-
-/**
- * Add a message to conversation history
- */
-function addToConversation(userId, role, content) {
-  if (!conversationHistory.has(userId)) {
-    conversationHistory.set(userId, {
-      messages: [],
-      lastActivity: Date.now()
-    });
-  }
-
-  const userConvo = conversationHistory.get(userId);
-  userConvo.messages.push({ role, content, timestamp: Date.now() });
-  userConvo.lastActivity = Date.now();
-
-  // Trim to max messages (keep pairs: user + assistant)
-  while (userConvo.messages.length > CONVERSATION_MAX_MESSAGES * 2) {
-    userConvo.messages.shift();
-  }
-}
-
-/**
- * Get conversation history for a user
- */
-function getConversationHistory(userId) {
-  const userConvo = conversationHistory.get(userId);
-  if (!userConvo) return [];
-
-  // Check if conversation expired
-  if (Date.now() - userConvo.lastActivity > CONVERSATION_TIMEOUT_MS) {
-    conversationHistory.delete(userId);
-    return [];
-  }
-
-  return userConvo.messages;
-}
-
-/**
- * Clear conversation history for a user
- */
-function clearConversation(userId) {
-  conversationHistory.delete(userId);
-}
-
-/**
- * Format conversation history for prompt
- */
-function formatConversationForPrompt(history) {
-  if (!history || history.length === 0) return '';
-
-  const formatted = history.map(msg => {
-    const role = msg.role === 'user' ? '用戶' : 'KITT';
-    return `${role}: ${msg.content}`;
-  }).join('\n');
-
-  return `\n\n## 最近對話記錄:\n${formatted}\n`;
-}
+// ============ CONVERSATION MEMORY (SQLite) ============
+// Now handled by ./storage/conversations.js
+// Functions: addMessage, getHistory, clearHistory, formatForPrompt
 
 /**
  * Load all knowledge base files into memory
@@ -161,42 +105,11 @@ function watchKnowledgeBase() {
 loadKnowledgeBase();
 watchKnowledgeBase();
 
-// ============ PENDING UPDATES SYSTEM ============
+// ============ PENDING UPDATES SYSTEM (SQLite) ============
+// Now handled by ./storage/updates.js
+// Functions: createUpdate, getUpdate, getPendingUpdates, updateStatus, editUpdate
 
-const PENDING_UPDATES_PATH = path.join(KB_BASE_PATH, '.kitt-pending-updates.json');
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'U08MZ609BGX';
-
-/**
- * Load pending updates from file
- */
-function loadPendingUpdates() {
-  try {
-    if (fs.existsSync(PENDING_UPDATES_PATH)) {
-      return JSON.parse(fs.readFileSync(PENDING_UPDATES_PATH, 'utf8'));
-    }
-  } catch (error) {
-    console.error('Error loading pending updates:', error.message);
-  }
-  return [];
-}
-
-/**
- * Save pending updates to file
- */
-function savePendingUpdates(updates) {
-  try {
-    fs.writeFileSync(PENDING_UPDATES_PATH, JSON.stringify(updates, null, 2));
-  } catch (error) {
-    console.error('Error saving pending updates:', error.message);
-  }
-}
-
-/**
- * Generate short ID for updates
- */
-function generateUpdateId() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
 
 /**
  * Rule-based quick check for potential knowledge updates
@@ -627,7 +540,7 @@ async function generateAIResponse(userMessage, userLang, context = {}) {
 
     // Get conversation history if userId is provided
     const conversationContext = context.userId
-      ? formatConversationForPrompt(getConversationHistory(context.userId))
+      ? formatForPrompt(getHistory(context.userId))
       : '';
 
     const systemPrompt = `You are KITT (Knight Industries Team Tool), an advanced AI assistant in a Slack workspace for IrisGo.AI team.
@@ -951,20 +864,13 @@ app.command('/kitt', async ({ command, ack, say, client }) => {
             return;
           }
 
-          const update = {
-            id: generateUpdateId(),
+          // Create update in SQLite
+          const update = createUpdate({
             type: updateType,
             target: target,
             value: value,
-            submittedBy: command.user_id,
-            submittedAt: new Date().toISOString(),
-            status: 'pending'
-          };
-
-          // Save to pending updates
-          const pendingUpdates = loadPendingUpdates();
-          pendingUpdates.push(update);
-          savePendingUpdates(pendingUpdates);
+            submittedBy: command.user_id
+          });
 
           // Notify admin
           await notifyAdminOfUpdate(client, update);
@@ -992,7 +898,7 @@ app.command('/kitt', async ({ command, ack, say, client }) => {
             return;
           }
 
-          const pendingUpdates = loadPendingUpdates().filter(u => u.status === 'pending');
+          const pendingUpdates = getPendingUpdates();
 
           if (pendingUpdates.length === 0) {
             await say('✅ No pending updates to review.');
@@ -1028,23 +934,18 @@ app.command('/kitt', async ({ command, ack, say, client }) => {
             return;
           }
 
-          const allUpdates = loadPendingUpdates();
-          const updateIndex = allUpdates.findIndex(u => u.id === approveId && u.status === 'pending');
+          const updateToApprove = getUpdate(approveId);
 
-          if (updateIndex === -1) {
+          if (!updateToApprove || updateToApprove.status !== 'pending') {
             await say(`❌ Update \`${approveId}\` not found or already processed.`);
             return;
           }
-
-          const updateToApprove = allUpdates[updateIndex];
 
           // Apply the update to PKM
           const applied = applyUpdate(updateToApprove);
 
           if (applied) {
-            updateToApprove.status = 'approved';
-            updateToApprove.processedAt = new Date().toISOString();
-            savePendingUpdates(allUpdates);
+            updateStatus(approveId, 'approved');
 
             // Notify submitter
             await notifyUserOfResult(client, updateToApprove.submittedBy, updateToApprove, true);
@@ -1080,29 +981,20 @@ app.command('/kitt', async ({ command, ack, say, client }) => {
             return;
           }
 
-          const allUpdatesForEdit = loadPendingUpdates();
-          const editIndex = allUpdatesForEdit.findIndex(u => u.id === editId && u.status === 'pending');
+          const updateToEdit = getUpdate(editId);
 
-          if (editIndex === -1) {
+          if (!updateToEdit || updateToEdit.status !== 'pending') {
             await say(`❌ Update \`${editId}\` not found or already processed.`);
             return;
           }
 
-          const updateToEdit = allUpdatesForEdit[editIndex];
           const oldTarget = updateToEdit.target;
           const oldValue = updateToEdit.value;
 
           // Update the values if provided
-          if (newTarget) {
-            updateToEdit.target = newTarget;
-          }
-          if (newValue) {
-            updateToEdit.value = newValue;
-          }
-          updateToEdit.editedAt = new Date().toISOString();
-          updateToEdit.editedBy = command.user_id;
-
-          savePendingUpdates(allUpdatesForEdit);
+          const finalTarget = newTarget || oldTarget;
+          const finalValue = newValue || oldValue;
+          editUpdate(editId, finalTarget, finalValue, command.user_id);
 
           await say({
             text: 'Update edited',
@@ -1110,7 +1002,7 @@ app.command('/kitt', async ({ command, ack, say, client }) => {
               type: 'section',
               text: {
                 type: 'mrkdwn',
-                text: `✏️ *Update \`${editId}\` Edited*\n\n*Before:*\n• Target: ${oldTarget}\n• Value: ${oldValue}\n\n*After:*\n• Target: ${updateToEdit.target}\n• Value: ${updateToEdit.value}\n\n_Use \`/kitt approve ${editId}\` or \`/kitt reject ${editId}\` to complete._`
+                text: `✏️ *Update \`${editId}\` Edited*\n\n*Before:*\n• Target: ${oldTarget}\n• Value: ${oldValue}\n\n*After:*\n• Target: ${finalTarget}\n• Value: ${finalValue}\n\n_Use \`/kitt approve ${editId}\` or \`/kitt reject ${editId}\` to complete._`
               }
             }]
           });
@@ -1133,18 +1025,14 @@ app.command('/kitt', async ({ command, ack, say, client }) => {
             return;
           }
 
-          const allUpdatesForReject = loadPendingUpdates();
-          const rejectIndex = allUpdatesForReject.findIndex(u => u.id === rejectId && u.status === 'pending');
+          const updateToReject = getUpdate(rejectId);
 
-          if (rejectIndex === -1) {
+          if (!updateToReject || updateToReject.status !== 'pending') {
             await say(`❌ Update \`${rejectId}\` not found or already processed.`);
             return;
           }
 
-          const updateToReject = allUpdatesForReject[rejectIndex];
-          updateToReject.status = 'rejected';
-          updateToReject.processedAt = new Date().toISOString();
-          savePendingUpdates(allUpdatesForReject);
+          updateStatus(rejectId, 'rejected');
 
           // Notify submitter
           await notifyUserOfResult(client, updateToReject.submittedBy, updateToReject, false);
@@ -1191,10 +1079,9 @@ app.action(/approve_update_(.*)/, async ({ action, ack, body, client }) => {
   console.log(`[Button] Approve clicked for ${updateId}`);
 
   try {
-    const allUpdates = loadPendingUpdates();
-    const updateIndex = allUpdates.findIndex(u => u.id === updateId && u.status === 'pending');
+    const updateToApprove = getUpdate(updateId);
 
-    if (updateIndex === -1) {
+    if (!updateToApprove || updateToApprove.status !== 'pending') {
       await client.chat.postMessage({
         channel: body.channel.id,
         text: `❌ Update \`${updateId}\` not found or already processed.`
@@ -1202,13 +1089,10 @@ app.action(/approve_update_(.*)/, async ({ action, ack, body, client }) => {
       return;
     }
 
-    const updateToApprove = allUpdates[updateIndex];
     const applied = applyUpdate(updateToApprove);
 
     if (applied) {
-      updateToApprove.status = 'approved';
-      updateToApprove.processedAt = new Date().toISOString();
-      savePendingUpdates(allUpdates);
+      updateStatus(updateId, 'approved');
 
       // Notify submitter
       await notifyUserOfResult(client, updateToApprove.submittedBy, updateToApprove, true);
@@ -1222,10 +1106,7 @@ app.action(/approve_update_(.*)/, async ({ action, ack, body, client }) => {
       });
     } else {
       // Still mark as approved even if auto-apply failed
-      updateToApprove.status = 'approved';
-      updateToApprove.processedAt = new Date().toISOString();
-      updateToApprove.note = 'Auto-apply not supported for this type';
-      savePendingUpdates(allUpdates);
+      updateStatus(updateId, 'approved', 'Auto-apply not supported for this type');
 
       // Notify submitter
       await notifyUserOfResult(client, updateToApprove.submittedBy, updateToApprove, true);
@@ -1254,10 +1135,9 @@ app.action(/edit_update_(.*)/, async ({ action, ack, body, client }) => {
   console.log(`[Button] Edit clicked for ${updateId}`);
 
   try {
-    const allUpdates = loadPendingUpdates();
-    const update = allUpdates.find(u => u.id === updateId && u.status === 'pending');
+    const update = getUpdate(updateId);
 
-    if (!update) {
+    if (!update || update.status !== 'pending') {
       await client.chat.postMessage({
         channel: body.channel.id,
         text: `❌ Update \`${updateId}\` not found or already processed.`
@@ -1330,10 +1210,9 @@ app.view(/edit_modal_(.*)/, async ({ ack, body, view, client }) => {
     const newTarget = view.state.values.target_block.target_input.value;
     const newValue = view.state.values.value_block.value_input.value;
 
-    const allUpdates = loadPendingUpdates();
-    const updateIndex = allUpdates.findIndex(u => u.id === updateId && u.status === 'pending');
+    const updateToEdit = getUpdate(updateId);
 
-    if (updateIndex === -1) {
+    if (!updateToEdit || updateToEdit.status !== 'pending') {
       // DM admin with error
       const dmResult = await client.conversations.open({ users: ADMIN_USER_ID });
       await client.chat.postMessage({
@@ -1343,16 +1222,10 @@ app.view(/edit_modal_(.*)/, async ({ ack, body, view, client }) => {
       return;
     }
 
-    const updateToEdit = allUpdates[updateIndex];
     const oldTarget = updateToEdit.target;
     const oldValue = updateToEdit.value;
 
-    updateToEdit.target = newTarget;
-    updateToEdit.value = newValue;
-    updateToEdit.editedAt = new Date().toISOString();
-    updateToEdit.editedBy = body.user.id;
-
-    savePendingUpdates(allUpdates);
+    editUpdate(updateId, newTarget, newValue, body.user.id);
 
     // DM admin with confirmation
     const dmResult = await client.conversations.open({ users: ADMIN_USER_ID });
@@ -1401,10 +1274,9 @@ app.action(/reject_update_(.*)/, async ({ action, ack, body, client }) => {
   console.log(`[Button] Reject clicked for ${updateId}`);
 
   try {
-    const allUpdates = loadPendingUpdates();
-    const updateIndex = allUpdates.findIndex(u => u.id === updateId && u.status === 'pending');
+    const updateToReject = getUpdate(updateId);
 
-    if (updateIndex === -1) {
+    if (!updateToReject || updateToReject.status !== 'pending') {
       await client.chat.postMessage({
         channel: body.channel.id,
         text: `❌ Update \`${updateId}\` not found or already processed.`
@@ -1412,10 +1284,7 @@ app.action(/reject_update_(.*)/, async ({ action, ack, body, client }) => {
       return;
     }
 
-    const updateToReject = allUpdates[updateIndex];
-    updateToReject.status = 'rejected';
-    updateToReject.processedAt = new Date().toISOString();
-    savePendingUpdates(allUpdates);
+    updateStatus(updateId, 'rejected');
 
     // Notify submitter
     await notifyUserOfResult(client, updateToReject.submittedBy, updateToReject, false);
@@ -1517,21 +1386,14 @@ app.event('message', async ({ event, say, client }) => {
 
         const { type, target } = extractKnowledgeInfo(event.text);
 
-        const update = {
-          id: generateUpdateId(),
+        // Create update in SQLite
+        const update = createUpdate({
           type: type,
           target: target,
           value: event.text,
           submittedBy: event.user,
-          submittedAt: new Date().toISOString(),
-          status: 'pending',
           source: 'dm'
-        };
-
-        // Save to pending updates
-        const pendingUpdates = loadPendingUpdates();
-        pendingUpdates.push(update);
-        savePendingUpdates(pendingUpdates);
+        });
 
         // Notify admin
         await notifyAdminOfUpdate(client, update);
@@ -1549,21 +1411,14 @@ app.event('message', async ({ event, say, client }) => {
 
         const { type, target } = extractKnowledgeInfo(event.text);
 
-        const update = {
-          id: generateUpdateId(),
+        // Create update in SQLite
+        const update = createUpdate({
           type: 'admin_correction',
           target: target,
           value: event.text,
           submittedBy: event.user,
-          submittedAt: new Date().toISOString(),
-          status: 'pending',
           source: 'admin_dm'
-        };
-
-        // Save to pending updates
-        const pendingUpdates = loadPendingUpdates();
-        pendingUpdates.push(update);
-        savePendingUpdates(pendingUpdates);
+        });
 
         // Notify admin (self)
         await notifyAdminOfUpdate(client, update);
@@ -1581,21 +1436,14 @@ app.event('message', async ({ event, say, client }) => {
 
         const { type, target } = extractKnowledgeInfo(event.text);
 
-        const update = {
-          id: generateUpdateId(),
+        // Create update in SQLite
+        const update = createUpdate({
           type: type,
           target: target,
           value: event.text,
           submittedBy: event.user,
-          submittedAt: new Date().toISOString(),
-          status: 'pending',
           source: 'admin_dm'
-        };
-
-        // Save to pending updates
-        const pendingUpdates = loadPendingUpdates();
-        pendingUpdates.push(update);
-        savePendingUpdates(pendingUpdates);
+        });
 
         // Notify admin (self)
         await notifyAdminOfUpdate(client, update);
@@ -1614,7 +1462,7 @@ app.event('message', async ({ event, say, client }) => {
         console.log(`[DEBUG] Detected language: ${userLang}`);
 
         // Save user message to conversation history
-        addToConversation(event.user, 'user', event.text);
+        addMessage(event.user, 'user', event.text);
 
         // Generate response with conversation context
         const response = await generateAIResponse(event.text, userLang, {
@@ -1624,7 +1472,7 @@ app.event('message', async ({ event, say, client }) => {
         console.log(`[DEBUG] AI response generated, length: ${response?.length || 0}`);
 
         // Save KITT response to conversation history
-        addToConversation(event.user, 'assistant', response);
+        addMessage(event.user, 'assistant', response);
 
         await say(response);
         console.log(`[DEBUG] Response sent via say()`);
@@ -1652,6 +1500,9 @@ app.message(async ({ message, say, client }) => {
 
 (async () => {
   try {
+    // Initialize SQLite database
+    initDB();
+
     await app.start();
     console.log('⚡️ KITT is online!');
     console.log(`🚗 Bot Name: ${process.env.BOT_NAME || 'KITT'}`);

@@ -8,15 +8,24 @@
     "dev": "nodemon bot.js",
     "test": "node test.js"
   },
-  "keywords": ["slack", "bot", "ai", "multilingual", "kitt", "collaboration", "knight-rider"],
+  "keywords": [
+    "slack",
+    "bot",
+    "ai",
+    "multilingual",
+    "kitt",
+    "collaboration",
+    "knight-rider"
+  ],
   "author": "Lman (IrisGo)",
   "license": "MIT",
   "dependencies": {
+    "@google/generative-ai": "^0.21.0",
     "@slack/bolt": "^3.18.0",
     "@slack/web-api": "^6.12.0",
-    "@google/generative-ai": "^0.21.0",
-    "dotenv": "^16.0.0",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "better-sqlite3": "^12.5.0",
+    "dotenv": "^16.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
