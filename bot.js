@@ -451,7 +451,46 @@ async function callOllama(prompt, maxTokens = 300) {
     }
 
     const data = await response.json();
-    return (data.response || data.thinking || '').trim();
+
+    // Handle gpt-oss model that puts answers in thinking instead of response
+    if (data.response && data.response.trim()) {
+      return data.response.trim();
+    }
+
+    // If response is empty but thinking exists, extract usable content
+    if (data.thinking && data.thinking.trim()) {
+      const thinking = data.thinking.trim();
+
+      // Try to find quoted answer patterns like "答案是..." or final statements
+      const patterns = [
+        /(?:So (?:I'll|we) (?:say|respond|answer)[:\s]+)["']?([^"'\n]+)["']?/i,
+        /(?:回答|答案|回覆)[：:\s]+["']?([^"'\n]+)["']?/,
+        /(?:Let's (?:say|respond))[:\s]+["']?([^"'\n]+)["']?/i,
+      ];
+
+      for (const pattern of patterns) {
+        const match = thinking.match(pattern);
+        if (match && match[1] && match[1].length > 10) {
+          return match[1].trim();
+        }
+      }
+
+      // Fallback: Get the last meaningful paragraph (likely the conclusion)
+      const paragraphs = thinking.split(/\n\n+/).filter(p => p.trim().length > 20);
+      if (paragraphs.length > 0) {
+        const lastParagraph = paragraphs[paragraphs.length - 1].trim();
+        // If last paragraph looks like a conclusion, use it
+        if (lastParagraph.length < 500) {
+          return lastParagraph;
+        }
+      }
+
+      // Last resort: Return truncated thinking with warning
+      console.warn('[Ollama] Using raw thinking output - response was empty');
+      return thinking.substring(0, 500) + (thinking.length > 500 ? '...' : '');
+    }
+
+    return '';
   } catch (error) {
     console.error('Ollama API error:', error.message);
     throw error;
