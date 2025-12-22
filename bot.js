@@ -1410,8 +1410,10 @@ app.event('message', async ({ event, say, client }) => {
       is_group: channel.channel?.is_group
     }));
 
-    if (channel.channel?.is_im) {
-      console.log(`[DM] User: ${event.user}, Text: ${event.text}`);
+    // Support both 1-on-1 DM (is_im) and group DM (is_mpim)
+    if (channel.channel?.is_im || channel.channel?.is_mpim) {
+      const dmType = channel.channel?.is_mpim ? 'Group DM' : 'DM';
+      console.log(`[${dmType}] User: ${event.user}, Text: ${event.text}`);
       console.log(`[DEBUG] Checking admin status...`);
 
       const isAdmin = event.user === ADMIN_USER_ID;
