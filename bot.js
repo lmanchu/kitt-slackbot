@@ -603,9 +603,12 @@ ${context.channel ? `- Channel: ${context.channel}` : ''}
 
 Instructions:
 - If there's conversation history, use it to understand the context of the current message
-- Respond naturally in the user's language (${userLang})
+- **CRITICAL: You MUST respond in ${userLang}** - If user writes in Chinese, respond in Chinese. If user writes in English, respond in English.
 - Be concise, helpful, and professional
-- If the user refers to something from earlier in the conversation, acknowledge it`;
+- If the user refers to something from earlier in the conversation, acknowledge it
+- Do NOT output your reasoning process. Only output the final answer.
+
+Your response (in ${userLang}):`;
 
     const result = await callOllama(systemPrompt, 500);
     return result.trim();
