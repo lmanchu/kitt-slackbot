@@ -16,6 +16,21 @@ const { initDB, getStats: getDBStats } = require('./storage/database');
 const { addMessage, getHistory, clearHistory, formatForPrompt, cleanupExpired } = require('./storage/conversations');
 const { createUpdate, getUpdate, getPendingUpdates, getAllUpdates, updateStatus, editUpdate } = require('./storage/updates');
 
+// Long-term Memory System (shared via Dropbox)
+const {
+  createCandidate,
+  getCandidate,
+  getPendingCandidates,
+  approveCandidate,
+  rejectCandidate,
+  editCandidateMemories,
+  searchMemories,
+  getStats: getMemoryStats
+} = require('./storage/memory');
+
+// Thread Analyzer
+const { analyzeThread, hasMemoryTrigger } = require('./lib/thread-analyzer');
+
 // Initialize Slack App
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -118,14 +133,30 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'U08MZ609BGX';
  * Used as first-pass filter before LLM confirmation
  */
 function detectKnowledgeUpdateIntent_RuleBased(text) {
+  // 🚫 Query patterns - 如果匹配這些，直接返回 false（不是 knowledge update）
+  const queryPatterns = [
+    /跟我說|告訴我|說一下|講一下|報告一下/,     // tell me (查詢)
+    /目前.*狀態|現在.*狀態|最新.*狀態/,         // current status (查詢)
+    /目前.*進度|現在.*進度|最新.*進度/,         // current progress (查詢)
+    /準備.*進度|進度.*如何|進度.*怎/,           // preparation progress (查詢)
+    /什麼|怎麼|如何|哪裡|哪個|幾時/,            // question words
+    /\?|？/,                                   // question mark
+  ];
+
+  // 如果是查詢，直接返回 false
+  if (queryPatterns.some(pattern => pattern.test(text))) {
+    console.log(`[DEBUG] Rule-based: Query pattern detected, NOT a knowledge update`);
+    return false;
+  }
+
+  // ✅ Update patterns - 必須匹配這些才可能是 knowledge update
   const updatePatterns = [
     /記得|記住|記錄|记得|记住|记录/,           // remember (繁體+簡體)
-    /更新|update/i,                           // update
+    /更新.*進度|進度.*更新|update.*progress/i, // progress update (需要動詞)
     /新增|加入|添加|add/i,                     // add
     /邀請了|邀请了|contacted|聯繫了|联系了/i,   // contacted someone (繁體+簡體)
     /已經.*完成|已完成|已经.*完成/,             // completed something
     /狀態.*變成|改為|changed|状态.*变成|改为/i, // status change (繁體+簡體)
-    /進度|进度|progress/i,                     // progress update (繁體+簡體)
     /幫我.*通知|帮我.*通知/,                    // notify request (繁體+簡體)
     /待[辦办]|todo/i,                          // todo item (繁體+簡體)
   ];
@@ -139,13 +170,21 @@ function detectKnowledgeUpdateIntent_RuleBased(text) {
  */
 async function detectKnowledgeUpdateIntent_LLM(text) {
   try {
-    const prompt = `Classify this message. Is it a request to UPDATE, RECORD, or REMEMBER information (like contacts, status, progress, tasks)?
+    const prompt = `Classify this message intent.
 
 Message: "${text}"
 
+Is this message asking to RECORD/UPDATE new information? Or just ASKING/QUERYING for existing information?
+
+Examples:
+- "跟我說一下 CES 進度" → QUERY (asking for info)
+- "CES 進度更新：已完成場地確認" → UPDATE (recording new info)
+- "告訴我目前狀態" → QUERY
+- "狀態變成已完成" → UPDATE
+
 Reply with ONLY one word:
-- YES (if it's asking to record/update/remember something)
-- NO (if it's just a question or general chat)
+- YES (if recording/updating NEW information)
+- NO (if asking/querying for existing info, or general chat)
 
 Answer:`;
 
@@ -368,6 +407,138 @@ async function notifyUserOfResult(client, userId, update, approved) {
   }
 }
 
+// ============ MEMORY SYSTEM FUNCTIONS ============
+
+/**
+ * Notify admin of new memory candidate via DM
+ */
+async function notifyAdminOfMemoryCandidate(client, candidate) {
+  try {
+    const dmResult = await client.conversations.open({ users: ADMIN_USER_ID });
+    const dmChannelId = dmResult.channel.id;
+
+    // Format extracted memories for display
+    const memoriesList = candidate.extractedMemories.map((mem, i) => {
+      const typeEmoji = {
+        decision: '🎯',
+        action: '📋',
+        preference: '💡',
+        fact: '📌',
+        context: '📝'
+      }[mem.type] || '•';
+      return `${typeEmoji} *${mem.type}*: ${mem.content}${mem.context ? ` _(${mem.context})_` : ''}`;
+    }).join('\n');
+
+    const threadLink = candidate.threadUrl
+      ? `<${candidate.threadUrl}|View Thread>`
+      : `Thread: ${candidate.thread_ts}`;
+
+    await client.chat.postMessage({
+      channel: dmChannelId,
+      text: `New memory candidate pending approval`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*🧠 New Memory Candidate*\n\n*ID:* \`${candidate.id}\`\n*Channel:* #${candidate.channel_name || candidate.channel}\n*Thread:* ${threadLink}\n*From:* <@${candidate.submitted_by}>`
+          }
+        },
+        {
+          type: 'divider'
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Extracted Memories (${candidate.extractedMemories.length}):*\n\n${memoriesList}`
+          }
+        },
+        {
+          type: 'context',
+          elements: [
+            {
+              type: 'mrkdwn',
+              text: `_These memories will be saved to the shared database if approved._`
+            }
+          ]
+        },
+        {
+          type: 'actions',
+          elements: [
+            {
+              type: 'button',
+              text: { type: 'plain_text', text: '✅ Approve All' },
+              style: 'primary',
+              action_id: `approve_memory_${candidate.id}`
+            },
+            {
+              type: 'button',
+              text: { type: 'plain_text', text: '✏️ Edit' },
+              action_id: `edit_memory_${candidate.id}`
+            },
+            {
+              type: 'button',
+              text: { type: 'plain_text', text: '❌ Reject' },
+              style: 'danger',
+              action_id: `reject_memory_${candidate.id}`
+            }
+          ]
+        }
+      ]
+    });
+    console.log(`📬 Notified admin of memory candidate ${candidate.id}`);
+  } catch (error) {
+    console.error('Error notifying admin of memory:', error.message);
+  }
+}
+
+/**
+ * Process memory trigger from thread
+ * Called when user says "@KITT 記住" in a thread
+ */
+async function processMemoryTrigger(client, channel, threadTs, userId, say) {
+  console.log(`[Memory] Processing memory trigger in channel ${channel}, thread ${threadTs}`);
+
+  // Acknowledge the request
+  await say({
+    text: '🧠 正在分析這個 thread...',
+    thread_ts: threadTs
+  });
+
+  // Analyze the thread
+  const result = await analyzeThread(client, callAI, channel, threadTs, userId);
+
+  if (!result.success) {
+    await say({
+      text: `❌ 無法分析 thread: ${result.error}`,
+      thread_ts: threadTs
+    });
+    return;
+  }
+
+  if (result.data.extractedMemories.length === 0) {
+    await say({
+      text: '📭 這個 thread 沒有發現需要記住的重點資訊。',
+      thread_ts: threadTs
+    });
+    return;
+  }
+
+  // Create memory candidate
+  const candidate = createCandidate(result.data);
+
+  // Notify admin
+  await notifyAdminOfMemoryCandidate(client, candidate);
+
+  // Confirm to user
+  const memCount = result.data.extractedMemories.length;
+  await say({
+    text: `✅ 已提取 ${memCount} 條記憶，已通知管理員審核。\n\nID: \`${candidate.id}\``,
+    thread_ts: threadTs
+  });
+}
+
 /**
  * Apply approved update to PKM files
  */
@@ -514,9 +685,10 @@ async function callOllama(prompt, maxTokens = 300) {
  * @returns {Promise<string>} - Generated text
  */
 async function callAI(prompt, maxTokens = 300) {
+  // 優先使用 OpenAI (gpt-4o-mini) - 中文處理更好，回覆更完整
   const providers = [
-    { name: 'Gemini', fn: callGemini, enabled: !!GEMINI_API_KEY },
     { name: 'OpenAI', fn: callOpenAI, enabled: !!OPENAI_API_KEY },
+    { name: 'Gemini', fn: callGemini, enabled: !!GEMINI_API_KEY },
     { name: 'Ollama', fn: callOllama, enabled: true }
   ];
 
@@ -612,7 +784,28 @@ async function generateAIResponse(userMessage, userLang, context = {}) {
   try {
     // Extract relevant knowledge from knowledge base
     const productInfo = knowledgeBase.product ? `\n\nProduct Details:\n${knowledgeBase.product.substring(0, 3000)}` : '';
-    const currentPriorities = knowledgeBase.priorities ? `\n\nCurrent Priorities:\n${knowledgeBase.priorities.substring(0, 1000)}` : '';
+    const currentPriorities = knowledgeBase.priorities ? `\n\nCurrent Priorities:\n${knowledgeBase.priorities.substring(0, 2000)}` : '';
+
+    // 🆕 動態載入相關 knowledge base（根據問題內容）
+    let additionalContext = '';
+    const lowerMsg = userMessage.toLowerCase();
+
+    // CES 相關問題 → 載入 customers + pmMemory
+    if (lowerMsg.includes('ces') || lowerMsg.includes('展會') || lowerMsg.includes('展位')) {
+      const customersInfo = knowledgeBase.customers ? knowledgeBase.customers.substring(0, 2500) : '';
+      const pmInfo = knowledgeBase.pmMemory ? knowledgeBase.pmMemory.substring(0, 2500) : '';
+      additionalContext += `\n\n📅 CES 2026 相關資訊:\n展位: Venetian #60837\n日期: 2026-01-07~10\n\nCustomer Pipeline:\n${customersInfo}\n\nPM Memory:\n${pmInfo}`;
+    }
+    // OEM/客戶相關問題 → 載入 customers
+    else if (lowerMsg.includes('oem') || lowerMsg.includes('客戶') || lowerMsg.includes('asus') || lowerMsg.includes('hp') || lowerMsg.includes('lenovo') || lowerMsg.includes('gigabyte') || lowerMsg.includes('mouse')) {
+      const customersInfo = knowledgeBase.customers ? knowledgeBase.customers.substring(0, 3000) : '';
+      additionalContext += `\n\nCustomer Pipeline:\n${customersInfo}`;
+    }
+    // 進度/狀態相關問題 → 載入 pmMemory
+    else if (lowerMsg.includes('進度') || lowerMsg.includes('狀態') || lowerMsg.includes('status') || lowerMsg.includes('progress')) {
+      const pmInfo = knowledgeBase.pmMemory ? knowledgeBase.pmMemory.substring(0, 3000) : '';
+      additionalContext += `\n\nPM Memory & Progress:\n${pmInfo}`;
+    }
 
     // Get conversation history if userId is provided
     const conversationContext = context.userId
@@ -631,6 +824,7 @@ Your personality:
 About IrisGo.AI (Updated: ${knowledgeBase.lastUpdated || 'N/A'}):
 ${productInfo || '- IrisGo is a Personal AI Assistant product (B2C consumer product)\n- Privacy-first, on-device AI solution\n- Helps users manage knowledge, tasks, and daily workflows\n- Uses local AI models for maximum privacy\n- While the product is B2C, we explore B2B distribution channels (e.g., OEM partnerships with PC manufacturers)\n- NOT an enterprise B2B SaaS service'}
 ${currentPriorities}
+${additionalContext}
 ${conversationContext}
 Context:
 - User's language: ${userLang}
@@ -647,7 +841,9 @@ Instructions:
 
 Your response (in ${userLang}):`;
 
-    const result = await callAI(systemPrompt, 500);
+    // 根據問題複雜度調整 token 限制
+    const maxTokens = additionalContext ? 800 : 500;
+    const result = await callAI(systemPrompt, maxTokens);
     return result.trim();
   } catch (error) {
     console.error('AI response error:', error.message);
@@ -1381,6 +1577,233 @@ app.action(/reject_update_(.*)/, async ({ action, ack, body, client }) => {
   }
 });
 
+// ============ MEMORY BUTTON HANDLERS ============
+
+/**
+ * Handle memory approve button click
+ */
+app.action(/approve_memory_(.*)/, async ({ action, ack, body, client }) => {
+  await ack();
+
+  const candidateId = action.action_id.replace('approve_memory_', '');
+  console.log(`[Memory Button] Approve clicked for ${candidateId}`);
+
+  try {
+    const candidate = getCandidate(candidateId);
+
+    if (!candidate || candidate.status !== 'pending') {
+      await client.chat.postMessage({
+        channel: body.channel.id,
+        text: `❌ Memory candidate \`${candidateId}\` not found or already processed.`
+      });
+      return;
+    }
+
+    // Approve and save to shared database
+    const createdIds = approveCandidate(candidateId, body.user.id);
+
+    if (createdIds && createdIds.length > 0) {
+      await client.chat.postMessage({
+        channel: body.channel.id,
+        text: `✅ *Memory Approved*\n\n${createdIds.length} memories saved to shared database.\n\nIDs: ${createdIds.map(id => `\`${id}\``).join(', ')}\n\n_Iris/Lucy can now query these memories._`
+      });
+
+      // Notify the submitter
+      try {
+        const dmResult = await client.conversations.open({ users: candidate.submitted_by });
+        await client.chat.postMessage({
+          channel: dmResult.channel.id,
+          text: `✅ 你的記憶請求已通過審核！\n\n${createdIds.length} 條記憶已保存。`
+        });
+      } catch (e) {
+        console.error('Failed to notify submitter:', e.message);
+      }
+    } else {
+      await client.chat.postMessage({
+        channel: body.channel.id,
+        text: `⚠️ Memory candidate approved but no memories were created.`
+      });
+    }
+  } catch (error) {
+    console.error('Memory approve error:', error);
+    await client.chat.postMessage({
+      channel: body.channel.id,
+      text: `❌ Error: ${error.message}`
+    });
+  }
+});
+
+/**
+ * Handle memory edit button click - opens modal
+ */
+app.action(/edit_memory_(.*)/, async ({ action, ack, body, client }) => {
+  await ack();
+
+  const candidateId = action.action_id.replace('edit_memory_', '');
+  console.log(`[Memory Button] Edit clicked for ${candidateId}`);
+
+  try {
+    const candidate = getCandidate(candidateId);
+
+    if (!candidate || candidate.status !== 'pending') {
+      await client.chat.postMessage({
+        channel: body.channel.id,
+        text: `❌ Memory candidate \`${candidateId}\` not found or already processed.`
+      });
+      return;
+    }
+
+    // Format current memories as editable text
+    const memoriesText = candidate.extractedMemories.map((mem, i) => {
+      return `[${mem.type}] ${mem.content}${mem.context ? ` | ${mem.context}` : ''}`;
+    }).join('\n');
+
+    // Open modal for editing
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: `edit_memory_modal_${candidateId}`,
+        title: { type: 'plain_text', text: 'Edit Memories' },
+        submit: { type: 'plain_text', text: 'Save & Approve' },
+        close: { type: 'plain_text', text: 'Cancel' },
+        blocks: [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `*ID:* \`${candidate.id}\`\n*Channel:* #${candidate.channel_name || candidate.channel}`
+            }
+          },
+          {
+            type: 'input',
+            block_id: 'memories_block',
+            element: {
+              type: 'plain_text_input',
+              action_id: 'memories_input',
+              multiline: true,
+              initial_value: memoriesText,
+              placeholder: { type: 'plain_text', text: '[type] content | context\nOne memory per line' }
+            },
+            label: { type: 'plain_text', text: 'Memories (one per line)' },
+            hint: { type: 'plain_text', text: 'Format: [decision|action|preference|fact|context] content | optional context' }
+          }
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('Memory edit button error:', error);
+    await client.chat.postMessage({
+      channel: body.channel.id,
+      text: `❌ Error opening edit modal: ${error.message}`
+    });
+  }
+});
+
+/**
+ * Handle memory edit modal submission
+ */
+app.view(/edit_memory_modal_(.*)/, async ({ ack, body, view, client }) => {
+  await ack();
+
+  const candidateId = view.callback_id.replace('edit_memory_modal_', '');
+  console.log(`[Memory Modal] Edit submitted for ${candidateId}`);
+
+  try {
+    const memoriesText = view.state.values.memories_block.memories_input.value;
+
+    // Parse edited memories
+    const lines = memoriesText.split('\n').filter(line => line.trim());
+    const newMemories = [];
+
+    for (const line of lines) {
+      // Parse format: [type] content | context
+      const typeMatch = line.match(/^\[(\w+)\]\s*/);
+      if (!typeMatch) continue;
+
+      const type = typeMatch[1];
+      const rest = line.replace(typeMatch[0], '');
+      const parts = rest.split('|').map(p => p.trim());
+
+      newMemories.push({
+        type: type,
+        content: parts[0],
+        context: parts[1] || null,
+        tags: []
+      });
+    }
+
+    if (newMemories.length === 0) {
+      const dmResult = await client.conversations.open({ users: ADMIN_USER_ID });
+      await client.chat.postMessage({
+        channel: dmResult.channel.id,
+        text: `⚠️ No valid memories found after editing. Please use format: [type] content | context`
+      });
+      return;
+    }
+
+    // Update candidate with new memories
+    editCandidateMemories(candidateId, newMemories);
+
+    // Auto-approve after edit
+    const createdIds = approveCandidate(candidateId, body.user.id);
+
+    const dmResult = await client.conversations.open({ users: ADMIN_USER_ID });
+    await client.chat.postMessage({
+      channel: dmResult.channel.id,
+      text: `✅ *Memory Edited & Approved*\n\n${createdIds.length} memories saved.\n\nIDs: ${createdIds.map(id => `\`${id}\``).join(', ')}`
+    });
+  } catch (error) {
+    console.error('Memory modal submit error:', error);
+  }
+});
+
+/**
+ * Handle memory reject button click
+ */
+app.action(/reject_memory_(.*)/, async ({ action, ack, body, client }) => {
+  await ack();
+
+  const candidateId = action.action_id.replace('reject_memory_', '');
+  console.log(`[Memory Button] Reject clicked for ${candidateId}`);
+
+  try {
+    const candidate = getCandidate(candidateId);
+
+    if (!candidate || candidate.status !== 'pending') {
+      await client.chat.postMessage({
+        channel: body.channel.id,
+        text: `❌ Memory candidate \`${candidateId}\` not found or already processed.`
+      });
+      return;
+    }
+
+    rejectCandidate(candidateId, body.user.id);
+
+    await client.chat.postMessage({
+      channel: body.channel.id,
+      text: `❌ Memory candidate \`${candidateId}\` rejected.`
+    });
+
+    // Notify submitter
+    try {
+      const dmResult = await client.conversations.open({ users: candidate.submitted_by });
+      await client.chat.postMessage({
+        channel: dmResult.channel.id,
+        text: `❌ 你的記憶請求未通過審核。`
+      });
+    } catch (e) {
+      console.error('Failed to notify submitter:', e.message);
+    }
+  } catch (error) {
+    console.error('Memory reject error:', error);
+    await client.chat.postMessage({
+      channel: body.channel.id,
+      text: `❌ Error: ${error.message}`
+    });
+  }
+});
+
 // ============ MESSAGE LISTENERS ============
 
 /**
@@ -1395,6 +1818,19 @@ app.event('app_mention', async ({ event, say, client }) => {
 
     if (!message) {
       await say(`Hello <@${event.user}>! KITT here. How may I assist you? Try \`/kitt help\` to see what I can do.`);
+      return;
+    }
+
+    // Check for memory trigger (e.g., "記住", "remember")
+    if (hasMemoryTrigger(message)) {
+      console.log(`[mention] Memory trigger detected: "${message}"`);
+
+      // Determine the thread to analyze
+      // If this is a reply in a thread, use the thread_ts
+      // Otherwise, use the current message's ts as the thread start
+      const threadTs = event.thread_ts || event.ts;
+
+      await processMemoryTrigger(client, event.channel, threadTs, event.user, say);
       return;
     }
 
