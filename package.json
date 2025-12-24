@@ -1,6 +1,6 @@
 {
   "name": "kitt-slackbot",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "KITT - Knight Industries Team Tool - Multilingual AI collaboration assistant",
   "main": "bot.js",
   "scripts": {

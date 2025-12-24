@@ -31,6 +31,15 @@ const {
 // Thread Analyzer
 const { analyzeThread, hasMemoryTrigger } = require('./lib/thread-analyzer');
 
+// Message Relay System
+const {
+  createMessage,
+  getMessage,
+  markAsRead,
+  markAsReplied,
+  getPendingMessages
+} = require('./storage/messages');
+
 // Initialize Slack App
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -537,6 +546,168 @@ async function processMemoryTrigger(client, channel, threadTs, userId, say) {
     text: `✅ 已提取 ${memCount} 條記憶，已通知管理員審核。\n\nID: \`${candidate.id}\``,
     thread_ts: threadTs
   });
+}
+
+// ============ MESSAGE RELAY SYSTEM ============
+
+/**
+ * Check if message contains relay trigger
+ * e.g., "幫我轉達給 Lman", "跟老闆說", "Tell Lman"
+ */
+function hasRelayTrigger(text) {
+  const triggers = [
+    /幫我(轉達|傳達|告訴|跟).*(Lman|老闆|boss)/i,
+    /跟(Lman|老闆|boss)說/i,
+    /(轉達|傳達|告訴|通知).*(Lman|老闆|boss)/i,
+    /tell\s+(Lman|the\s+boss)/i,
+    /message\s+for\s+(Lman|the\s+boss)/i,
+    /let\s+(Lman|the\s+boss)\s+know/i,
+    /(Lman|老闆).*幫我(轉達|說)/i
+  ];
+
+  return triggers.some(pattern => pattern.test(text));
+}
+
+/**
+ * Extract the actual message to relay (remove trigger words)
+ */
+function extractRelayMessage(text) {
+  // Remove common trigger patterns to get the actual message
+  let message = text
+    .replace(/<@[A-Z0-9]+>/g, '') // Remove @mentions
+    .replace(/幫我(轉達|傳達|告訴|跟).*(Lman|老闆|boss)[，,：:]*\s*/gi, '')
+    .replace(/跟(Lman|老闆|boss)說[，,：:]*\s*/gi, '')
+    .replace(/(轉達|傳達|告訴|通知).*(Lman|老闆|boss)[，,：:]*\s*/gi, '')
+    .replace(/tell\s+(Lman|the\s+boss)[,:\s]*/gi, '')
+    .replace(/message\s+for\s+(Lman|the\s+boss)[,:\s]*/gi, '')
+    .replace(/let\s+(Lman|the\s+boss)\s+know[,:\s]*/gi, '')
+    .trim();
+
+  return message || text.replace(/<@[A-Z0-9]+>/g, '').trim();
+}
+
+/**
+ * Notify Lman of a new relay message
+ */
+async function notifyLmanOfMessage(client, msg) {
+  const adminUserId = process.env.ADMIN_USER_ID;
+  if (!adminUserId) {
+    console.error('[Relay] ADMIN_USER_ID not configured');
+    return;
+  }
+
+  try {
+    await client.chat.postMessage({
+      channel: adminUserId,
+      text: `📨 來自 ${msg.fromUserName} 的訊息`,
+      blocks: [
+        {
+          type: 'header',
+          text: {
+            type: 'plain_text',
+            text: '📨 新訊息轉達',
+            emoji: true
+          }
+        },
+        {
+          type: 'section',
+          fields: [
+            {
+              type: 'mrkdwn',
+              text: `*來自:*\n<@${msg.fromUser}> (${msg.fromUserName})`
+            },
+            {
+              type: 'mrkdwn',
+              text: `*頻道:*\n${msg.channelName ? `#${msg.channelName}` : 'DM'}`
+            }
+          ]
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*訊息內容:*\n> ${msg.message}`
+          }
+        },
+        {
+          type: 'context',
+          elements: [
+            {
+              type: 'mrkdwn',
+              text: `ID: \`${msg.id}\` | ${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}`
+            }
+          ]
+        },
+        {
+          type: 'actions',
+          elements: [
+            {
+              type: 'button',
+              text: {
+                type: 'plain_text',
+                text: '✓ 已讀',
+                emoji: true
+              },
+              style: 'primary',
+              action_id: `relay_read_${msg.id}`
+            },
+            {
+              type: 'button',
+              text: {
+                type: 'plain_text',
+                text: '💬 回覆',
+                emoji: true
+              },
+              action_id: `relay_reply_${msg.id}`
+            }
+          ]
+        }
+      ]
+    });
+
+    console.log(`[Relay] Notified Lman of message ${msg.id}`);
+  } catch (error) {
+    console.error('[Relay] Error notifying Lman:', error.message);
+  }
+}
+
+/**
+ * Process relay trigger
+ */
+async function processRelayTrigger(client, text, userId, channel, channelName, say) {
+  console.log(`[Relay] Processing relay from ${userId} in ${channelName || channel}`);
+
+  // Get user info
+  let userName = userId;
+  try {
+    const userInfo = await client.users.info({ user: userId });
+    userName = userInfo.user?.real_name || userInfo.user?.name || userId;
+  } catch (e) {
+    console.warn('[Relay] Could not get user name:', e.message);
+  }
+
+  // Extract the actual message
+  const relayMessage = extractRelayMessage(text);
+
+  if (!relayMessage || relayMessage.length < 2) {
+    await say('請告訴我要轉達的內容是什麼？');
+    return;
+  }
+
+  // Create message record
+  const msg = createMessage({
+    fromUser: userId,
+    fromUserName: userName,
+    message: relayMessage,
+    channel: channel,
+    channelName: channelName
+  });
+
+  // Notify Lman
+  await notifyLmanOfMessage(client, msg);
+
+  // Confirm to sender
+  await say(`📨 好的，我會轉達給 Lman：\n> ${relayMessage}\n\n_訊息編號: ${msg.id}_`);
 }
 
 /**
@@ -1813,6 +1984,195 @@ app.action(/reject_memory_(.*)/, async ({ action, ack, body, client }) => {
   }
 });
 
+// ============ RELAY MESSAGE BUTTON HANDLERS ============
+
+/**
+ * Handle relay message "已讀" button click
+ */
+app.action(/relay_read_(.*)/, async ({ action, ack, body, client }) => {
+  await ack();
+
+  const msgId = action.action_id.replace('relay_read_', '');
+  console.log(`[Relay Button] Read clicked for ${msgId}`);
+
+  try {
+    const msg = getMessage(msgId);
+
+    if (!msg) {
+      await client.chat.postMessage({
+        channel: body.channel.id,
+        text: `❌ 訊息 \`${msgId}\` 找不到。`
+      });
+      return;
+    }
+
+    markAsRead(msgId);
+
+    // Update the original message to show it's been read
+    await client.chat.update({
+      channel: body.channel.id,
+      ts: body.message.ts,
+      text: `✅ 已讀 - 來自 ${msg.from_user_name} 的訊息`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `✅ *已讀* - 來自 <@${msg.from_user}> 的訊息：\n> ${msg.message}\n\n_${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })} 標記為已讀_`
+          }
+        }
+      ]
+    });
+  } catch (error) {
+    console.error('Relay read error:', error);
+    await client.chat.postMessage({
+      channel: body.channel.id,
+      text: `❌ Error: ${error.message}`
+    });
+  }
+});
+
+/**
+ * Handle relay message "回覆" button click
+ */
+app.action(/relay_reply_(.*)/, async ({ action, ack, body, client }) => {
+  await ack();
+
+  const msgId = action.action_id.replace('relay_reply_', '');
+  console.log(`[Relay Button] Reply clicked for ${msgId}`);
+
+  try {
+    const msg = getMessage(msgId);
+
+    if (!msg) {
+      await client.chat.postMessage({
+        channel: body.channel.id,
+        text: `❌ 訊息 \`${msgId}\` 找不到。`
+      });
+      return;
+    }
+
+    // Open a modal for reply
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: `relay_reply_modal_${msgId}`,
+        title: {
+          type: 'plain_text',
+          text: '回覆訊息'
+        },
+        submit: {
+          type: 'plain_text',
+          text: '發送'
+        },
+        close: {
+          type: 'plain_text',
+          text: '取消'
+        },
+        blocks: [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `*原訊息來自:* ${msg.from_user_name}\n*內容:* ${msg.message}`
+            }
+          },
+          {
+            type: 'input',
+            block_id: 'reply_input',
+            label: {
+              type: 'plain_text',
+              text: '你的回覆'
+            },
+            element: {
+              type: 'plain_text_input',
+              action_id: 'reply_text',
+              multiline: true,
+              placeholder: {
+                type: 'plain_text',
+                text: '輸入要回覆給對方的訊息...'
+              }
+            }
+          }
+        ],
+        private_metadata: JSON.stringify({
+          msgId: msgId,
+          originalChannel: body.channel.id,
+          originalTs: body.message.ts
+        })
+      }
+    });
+  } catch (error) {
+    console.error('Relay reply modal error:', error);
+    await client.chat.postMessage({
+      channel: body.channel.id,
+      text: `❌ Error: ${error.message}`
+    });
+  }
+});
+
+/**
+ * Handle relay reply modal submission
+ */
+app.view(/relay_reply_modal_(.*)/, async ({ ack, view, client }) => {
+  await ack();
+
+  const msgId = view.callback_id.replace('relay_reply_modal_', '');
+  const replyText = view.state.values.reply_input.reply_text.value;
+  const metadata = JSON.parse(view.private_metadata);
+
+  console.log(`[Relay] Reply submitted for ${msgId}: ${replyText.substring(0, 50)}...`);
+
+  try {
+    const msg = getMessage(msgId);
+
+    if (!msg) {
+      console.error(`[Relay] Message ${msgId} not found for reply`);
+      return;
+    }
+
+    // Mark as replied
+    markAsReplied(msgId, replyText);
+
+    // Send reply to original sender via DM
+    const dmResult = await client.conversations.open({ users: msg.from_user });
+    await client.chat.postMessage({
+      channel: dmResult.channel.id,
+      text: `💬 Lman 回覆了你的訊息`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `💬 *Lman 回覆了你的訊息*\n\n你的原訊息：\n> ${msg.message}\n\nLman 的回覆：\n> ${replyText}`
+          }
+        }
+      ]
+    });
+
+    // Update original notification to show replied
+    await client.chat.update({
+      channel: metadata.originalChannel,
+      ts: metadata.originalTs,
+      text: `💬 已回覆 - 來自 ${msg.from_user_name} 的訊息`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `💬 *已回覆* - 來自 <@${msg.from_user}> 的訊息：\n> ${msg.message}\n\n你的回覆：\n> ${replyText}\n\n_${new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })} 已發送_`
+          }
+        }
+      ]
+    });
+
+    console.log(`[Relay] Reply sent to ${msg.from_user_name}`);
+  } catch (error) {
+    console.error('Relay reply error:', error);
+  }
+});
+
 // ============ MESSAGE LISTENERS ============
 
 /**
@@ -1840,6 +2200,23 @@ app.event('app_mention', async ({ event, say, client }) => {
       const threadTs = event.thread_ts || event.ts;
 
       await processMemoryTrigger(client, event.channel, threadTs, event.user, say);
+      return;
+    }
+
+    // Check for relay trigger (e.g., "幫我轉達給 Lman", "跟老闆說")
+    if (hasRelayTrigger(message)) {
+      console.log(`[mention] Relay trigger detected: "${message}"`);
+
+      // Get channel name
+      let channelName = null;
+      try {
+        const channelInfo = await client.conversations.info({ channel: event.channel });
+        channelName = channelInfo.channel?.name;
+      } catch (e) {
+        // May fail for DMs, that's ok
+      }
+
+      await processRelayTrigger(client, message, event.user, event.channel, channelName, say);
       return;
     }
 
@@ -2021,6 +2398,596 @@ app.message(async ({ message, say, client }) => {
   // ... disabled ...
 });
 */
+
+// ============ APP HOME TAB ============
+
+/**
+ * Build the App Home view for team members.
+ * Shows: Lman's focus, booking link, recent updates, company info shortcuts.
+ */
+function buildHomeView() {
+  const blocks = [];
+
+  // Header
+  blocks.push({
+    type: "header",
+    text: { type: "plain_text", text: "🚗 KITT - Lman's PM Assistant", emoji: true }
+  });
+
+  blocks.push({
+    type: "context",
+    elements: [
+      { type: "mrkdwn", text: "_Your gateway to company info & Lman_" }
+    ]
+  });
+
+  blocks.push({ type: "divider" });
+
+  // Current Focus Section
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: "*📌 Lman 目前專注*" }
+  });
+
+  // Extract priorities from knowledge base
+  let focusText = "";
+  if (knowledgeBase.priorities) {
+    // Parse P0 items from priorities
+    const p0Match = knowledgeBase.priorities.match(/### P0[^\n]*\n([\s\S]*?)(?=### P1|---|\n## )/);
+    if (p0Match) {
+      const p0Lines = p0Match[1].split('\n')
+        .filter(line => line.match(/^####|^- \[[ x]\]/))
+        .slice(0, 4)
+        .map(line => {
+          if (line.startsWith('####')) {
+            return `• *${line.replace(/^####\s*/, '').replace(/🚨|🔴/g, '').trim()}*`;
+          }
+          return `  ${line.replace(/^- \[[ x]\]/, '○').trim()}`;
+        });
+      focusText = p0Lines.join('\n');
+    }
+  }
+
+  if (!focusText) {
+    focusText = "• CES 2026 準備\n• OEM 合作追蹤\n• Mnemosyne Demo";
+  }
+
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: focusText }
+  });
+
+  blocks.push({
+    type: "actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "📋 詳細進度", emoji: true },
+        action_id: "home_view_priorities"
+      }
+    ]
+  });
+
+  blocks.push({ type: "divider" });
+
+  // Book Meeting Section
+  blocks.push({
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: "*🗓️ 約時間找 Lman*\n直接預約 1:1 會議時段"
+    },
+    accessory: {
+      type: "button",
+      text: { type: "plain_text", text: "預約會議", emoji: true },
+      url: "https://calendar.app.google/8477UdatSLsEVDzT8",
+      action_id: "home_book_meeting",
+      style: "primary"
+    }
+  });
+
+  blocks.push({ type: "divider" });
+
+  // Recent Updates Section
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: "*📢 最新動態*" }
+  });
+
+  // Get recent approved updates
+  const recentUpdates = getAllUpdates({ status: 'approved', limit: 3 });
+
+  if (recentUpdates.length > 0) {
+    const updatesText = recentUpdates.map(u => {
+      const date = new Date(u.submittedAt).toLocaleDateString('zh-TW', { month: 'numeric', day: 'numeric' });
+      const typeEmoji = { oem: '🤝', pending: '📝', ces: '🎪', contact: '👤' }[u.type] || '📌';
+      return `• ${date} ${typeEmoji} ${u.target}: ${u.value}`;
+    }).join('\n');
+
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: updatesText }
+    });
+  } else {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: "_暫無最新動態_" }
+    });
+  }
+
+  blocks.push({
+    type: "actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "查看全部", emoji: true },
+        action_id: "home_view_all_updates"
+      }
+    ]
+  });
+
+  blocks.push({ type: "divider" });
+
+  // Quick Actions Section
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: "*❓ 快速查詢*" }
+  });
+
+  blocks.push({
+    type: "actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "🏢 公司簡介", emoji: true },
+        action_id: "home_company_intro"
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "🎯 產品方向", emoji: true },
+        action_id: "home_product_direction"
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "👥 團隊資源", emoji: true },
+        action_id: "home_team_resources"
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "💬 留言給 Lman", emoji: true },
+        action_id: "home_leave_message"
+      }
+    ]
+  });
+
+  blocks.push({ type: "divider" });
+
+  // Footer Tips
+  blocks.push({
+    type: "context",
+    elements: [
+      { type: "mrkdwn", text: "💡 _私訊我任何問題，或在頻道 @KITT。我是 Lman 的 AI 特助，隨時為你服務！_" }
+    ]
+  });
+
+  // Last updated timestamp
+  blocks.push({
+    type: "context",
+    elements: [
+      { type: "mrkdwn", text: `_Knowledge Base 更新：${knowledgeBase.lastUpdated || 'N/A'}_` }
+    ]
+  });
+
+  return {
+    type: "home",
+    blocks: blocks
+  };
+}
+
+// App Home Opened Event
+app.event('app_home_opened', async ({ event, client, logger }) => {
+  try {
+    const userId = event.user;
+    console.log(`[App Home] User ${userId} opened home tab`);
+
+    await client.views.publish({
+      user_id: userId,
+      view: buildHomeView()
+    });
+
+    console.log(`[App Home] Published home view for ${userId}`);
+  } catch (error) {
+    logger.error(`[App Home] Error publishing home tab: ${error}`);
+  }
+});
+
+// ============ APP HOME BUTTON ACTIONS ============
+
+// View Priorities Modal
+app.action('home_view_priorities', async ({ ack, body, client }) => {
+  await ack();
+
+  try {
+    let prioritiesContent = knowledgeBase.priorities || '_優先事項資料未載入_';
+
+    // Truncate if too long for modal (max ~3000 chars for text block)
+    if (prioritiesContent.length > 2500) {
+      prioritiesContent = prioritiesContent.substring(0, 2500) + '\n\n_...（內容過長，已截斷）_';
+    }
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        title: { type: "plain_text", text: "📋 優先事項" },
+        close: { type: "plain_text", text: "關閉" },
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: prioritiesContent }
+          }
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('[home_view_priorities] Error:', error);
+  }
+});
+
+// View All Updates Modal
+app.action('home_view_all_updates', async ({ ack, body, client }) => {
+  await ack();
+
+  try {
+    const allUpdates = getAllUpdates({ status: 'approved', limit: 10 });
+
+    let blocks = [
+      {
+        type: "header",
+        text: { type: "plain_text", text: "📢 所有已發布動態", emoji: true }
+      },
+      { type: "divider" }
+    ];
+
+    if (allUpdates.length > 0) {
+      for (const u of allUpdates) {
+        const date = new Date(u.submittedAt).toLocaleDateString('zh-TW');
+        const typeLabel = { oem: 'OEM', pending: '待辦', ces: 'CES', contact: '聯絡人' }[u.type] || u.type;
+
+        blocks.push({
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `*${date}* [${typeLabel}]\n*${u.target}*: ${u.value}`
+          }
+        });
+      }
+    } else {
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: "_暫無已發布動態_" }
+      });
+    }
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        title: { type: "plain_text", text: "動態列表" },
+        close: { type: "plain_text", text: "關閉" },
+        blocks: blocks
+      }
+    });
+  } catch (error) {
+    console.error('[home_view_all_updates] Error:', error);
+  }
+});
+
+// Company Intro Modal
+app.action('home_company_intro', async ({ ack, body, client }) => {
+  await ack();
+
+  try {
+    let introText = "";
+
+    if (knowledgeBase.product) {
+      // Extract key info from product KB
+      const taglineMatch = knowledgeBase.product.match(/Tagline[：:]\s*(.+)/i);
+      const missionMatch = knowledgeBase.product.match(/Mission[：:]\s*(.+)/i);
+      const visionMatch = knowledgeBase.product.match(/Vision[：:]\s*(.+)/i);
+
+      introText = "*IrisGo.AI*\n\n";
+      if (taglineMatch) introText += `📌 *Tagline*: ${taglineMatch[1]}\n\n`;
+      if (missionMatch) introText += `🎯 *Mission*: ${missionMatch[1]}\n\n`;
+      if (visionMatch) introText += `🔮 *Vision*: ${visionMatch[1]}\n\n`;
+
+      if (!taglineMatch && !missionMatch && !visionMatch) {
+        // Fallback to first 1000 chars
+        introText = knowledgeBase.product.substring(0, 1000);
+      }
+    } else {
+      introText = "*IrisGo.AI*\n\nPersonal AI Assistant - 隱私優先的個人 AI 助手\n\n_更多資訊請私訊 KITT_";
+    }
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        title: { type: "plain_text", text: "🏢 公司簡介" },
+        close: { type: "plain_text", text: "關閉" },
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: introText }
+          }
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('[home_company_intro] Error:', error);
+  }
+});
+
+// Product Direction Modal
+app.action('home_product_direction', async ({ ack, body, client }) => {
+  await ack();
+
+  try {
+    let roadmapText = "";
+
+    if (knowledgeBase.roadmap) {
+      // Extract key roadmap items
+      roadmapText = knowledgeBase.roadmap.substring(0, 2500);
+      if (knowledgeBase.roadmap.length > 2500) {
+        roadmapText += '\n\n_...（內容過長，已截斷）_';
+      }
+    } else {
+      roadmapText = "*IrisGo 產品方向*\n\n• Mnemosyne - Context-Aware Engine\n• Skills Marketplace\n• Privacy-First AI\n\n_詳情請私訊 KITT_";
+    }
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        title: { type: "plain_text", text: "🎯 產品方向" },
+        close: { type: "plain_text", text: "關閉" },
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: roadmapText }
+          }
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('[home_product_direction] Error:', error);
+  }
+});
+
+// Team Resources Modal
+app.action('home_team_resources', async ({ ack, body, client }) => {
+  await ack();
+
+  try {
+    let resourcesText = "";
+
+    if (knowledgeBase.resources) {
+      resourcesText = knowledgeBase.resources.substring(0, 2500);
+      if (knowledgeBase.resources.length > 2500) {
+        resourcesText += '\n\n_...（內容過長，已截斷）_';
+      }
+    } else {
+      resourcesText = "*團隊資源*\n\n• Slack: #general, #product, #engineering\n• Google Drive: IrisGo Shared\n• GitHub: github.com/irisgo-ai\n\n_詳情請私訊 KITT_";
+    }
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        title: { type: "plain_text", text: "👥 團隊資源" },
+        close: { type: "plain_text", text: "關閉" },
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: resourcesText }
+          }
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('[home_team_resources] Error:', error);
+  }
+});
+
+// Leave Message Modal
+app.action('home_leave_message', async ({ ack, body, client }) => {
+  await ack();
+
+  try {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        callback_id: "leave_message_modal",
+        title: { type: "plain_text", text: "💬 留言給 Lman" },
+        submit: { type: "plain_text", text: "送出" },
+        close: { type: "plain_text", text: "取消" },
+        blocks: [
+          {
+            type: "input",
+            block_id: "message_type_block",
+            element: {
+              type: "static_select",
+              action_id: "message_type",
+              placeholder: { type: "plain_text", text: "選擇類型" },
+              options: [
+                { text: { type: "plain_text", text: "💡 建議 / Idea" }, value: "idea" },
+                { text: { type: "plain_text", text: "❓ 問題 / Question" }, value: "question" },
+                { text: { type: "plain_text", text: "📋 進度更新 / Update" }, value: "update" },
+                { text: { type: "plain_text", text: "🚨 緊急 / Urgent" }, value: "urgent" }
+              ]
+            },
+            label: { type: "plain_text", text: "類型" }
+          },
+          {
+            type: "input",
+            block_id: "message_content_block",
+            element: {
+              type: "plain_text_input",
+              action_id: "message_content",
+              multiline: true,
+              placeholder: { type: "plain_text", text: "輸入你想告訴 Lman 的內容..." }
+            },
+            label: { type: "plain_text", text: "內容" }
+          }
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('[home_leave_message] Error:', error);
+  }
+});
+
+// Handle Leave Message Modal Submission
+app.view('leave_message_modal', async ({ ack, body, view, client }) => {
+  await ack();
+
+  try {
+    const userId = body.user.id;
+    const messageType = view.state.values.message_type_block.message_type.selected_option.value;
+    const messageContent = view.state.values.message_content_block.message_content.value;
+
+    // Get user info
+    const userInfo = await client.users.info({ user: userId });
+    const userName = userInfo.user.real_name || userInfo.user.name;
+
+    // Create a relay message to Lman
+    const typeEmoji = { idea: '💡', question: '❓', update: '📋', urgent: '🚨' }[messageType] || '💬';
+    const typeLabel = { idea: '建議', question: '問題', update: '進度更新', urgent: '緊急' }[messageType] || '訊息';
+
+    // Send to Lman's DM (U02G6CRD4 is Lman's Slack ID)
+    const LMAN_USER_ID = process.env.LMAN_SLACK_ID || 'U02G6CRD4';
+
+    await client.chat.postMessage({
+      channel: LMAN_USER_ID,
+      text: `${typeEmoji} *來自 ${userName} 的${typeLabel}*`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `${typeEmoji} *來自 <@${userId}> 的${typeLabel}*\n\n${messageContent}`
+          }
+        },
+        {
+          type: "context",
+          elements: [
+            { type: "mrkdwn", text: `_透過 KITT App Home 送出 • ${new Date().toLocaleString('zh-TW')}_` }
+          ]
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "↩️ 回覆", emoji: true },
+              action_id: `quick_reply_${userId}`
+            }
+          ]
+        }
+      ]
+    });
+
+    // Confirm to sender
+    await client.chat.postMessage({
+      channel: userId,
+      text: `✅ 你的${typeLabel}已送達 Lman！\n\n> ${messageContent.substring(0, 100)}${messageContent.length > 100 ? '...' : ''}`
+    });
+
+    console.log(`[leave_message] ${userName} sent ${typeLabel} to Lman`);
+
+  } catch (error) {
+    console.error('[leave_message_modal] Error:', error);
+  }
+});
+
+// Quick Reply Action (for Lman to reply)
+app.action(/quick_reply_(.*)/, async ({ action, ack, body, client }) => {
+  await ack();
+
+  const targetUserId = action.action_id.replace('quick_reply_', '');
+
+  try {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        callback_id: `quick_reply_modal_${targetUserId}`,
+        title: { type: "plain_text", text: "↩️ 快速回覆" },
+        submit: { type: "plain_text", text: "送出" },
+        close: { type: "plain_text", text: "取消" },
+        blocks: [
+          {
+            type: "context",
+            elements: [
+              { type: "mrkdwn", text: `回覆給 <@${targetUserId}>` }
+            ]
+          },
+          {
+            type: "input",
+            block_id: "reply_content_block",
+            element: {
+              type: "plain_text_input",
+              action_id: "reply_content",
+              multiline: true,
+              placeholder: { type: "plain_text", text: "輸入回覆內容..." }
+            },
+            label: { type: "plain_text", text: "內容" }
+          }
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('[quick_reply] Error:', error);
+  }
+});
+
+// Handle Quick Reply Modal Submission
+app.view(/quick_reply_modal_(.*)/, async ({ ack, view, client }) => {
+  await ack();
+
+  const targetUserId = view.callback_id.replace('quick_reply_modal_', '');
+  const replyContent = view.state.values.reply_content_block.reply_content.value;
+
+  try {
+    await client.chat.postMessage({
+      channel: targetUserId,
+      text: `💬 *Lman 回覆你：*\n\n${replyContent}`,
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: `💬 *Lman 回覆你：*\n\n${replyContent}` }
+        },
+        {
+          type: "context",
+          elements: [
+            { type: "mrkdwn", text: `_${new Date().toLocaleString('zh-TW')}_` }
+          ]
+        }
+      ]
+    });
+
+    console.log(`[quick_reply] Lman replied to ${targetUserId}`);
+  } catch (error) {
+    console.error('[quick_reply_modal] Error:', error);
+  }
+});
+
+// Book Meeting Action (just for logging, actual link opens in browser)
+app.action('home_book_meeting', async ({ ack }) => {
+  await ack();
+  console.log('[App Home] User clicked book meeting button');
+});
 
 // ============ STARTUP ============
 
