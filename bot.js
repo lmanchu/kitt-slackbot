@@ -6,7 +6,10 @@
  * "A shadowy flight into the dangerous world of team collaboration..."
  */
 
-require('dotenv').config();
+// Support loading different .env files via DOTENV_CONFIG_PATH
+require('dotenv').config({
+  path: process.env.DOTENV_CONFIG_PATH || '.env'
+});
 const { App } = require('@slack/bolt');
 const fs = require('fs');
 const path = require('path');
@@ -40,6 +43,13 @@ const {
   getPendingMessages
 } = require('./storage/messages');
 
+// Knowledge Base Manager
+const kbSubmit = require('./handlers/kb-submit');
+const kbReview = require('./handlers/kb-review');
+
+// Heartbeat System
+const { Heartbeat } = require('./shared/heartbeat');
+
 // Initialize Slack App
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -49,11 +59,16 @@ const app = new App({
   port: process.env.PORT || 3000
 });
 
-// AI Provider Configuration (fallback hierarchy: Gemini → OpenAI → Ollama)
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// AI Provider Configuration (unified via CLIProxyAPI → Ollama fallback)
+// All cloud AI (OpenAI, Gemini, Claude) goes through CLIProxyAPI
 const OLLAMA_API = 'http://localhost:11434/api/generate';
 const OLLAMA_MODEL = 'qwen2.5:3b';
+
+// CLIProxyAPI - Unified AI proxy (OAuth + API keys)
+// Supports: gemini-2.5-flash, claude-haiku-4-5, gpt-4o-mini, etc.
+const CLIPROXY_URL = process.env.CLIPROXY_URL || 'http://127.0.0.1:8317';
+const CLIPROXY_API_KEY = process.env.CLIPROXY_API_KEY || 'magi-proxy-key-2026';
+const CLIPROXY_MODEL = process.env.CLIPROXY_MODEL || 'gemini-2.5-flash';  // OAuth model, no quota limits
 
 // ============ KNOWLEDGE BASE SYSTEM ============
 
@@ -850,17 +865,42 @@ async function callOllama(prompt, maxTokens = 300) {
 }
 
 /**
- * Unified AI call with fallback hierarchy: Gemini → OpenAI → Ollama
+ * Call CLIProxyAPI (OAuth-based Gemini/Claude access, bypasses API quotas)
+ */
+async function callCLIProxy(prompt, maxTokens = 300) {
+  const response = await fetch(`${CLIPROXY_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${CLIPROXY_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: CLIPROXY_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      max_tokens: maxTokens
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`CLIProxyAPI error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content?.trim() || '';
+}
+
+/**
+ * Unified AI call with fallback hierarchy: OpenAI → CLIProxyAPI → Gemini → Ollama
  * @param {string} prompt - Prompt for the model
  * @param {number} maxTokens - Maximum tokens to generate
  * @returns {Promise<string>} - Generated text
  */
 async function callAI(prompt, maxTokens = 300) {
-  // 優先使用 OpenAI (gpt-4o-mini) - 中文處理更好，回覆更完整
+  // Simplified: CLIProxyAPI (handles all cloud AI) → Ollama (local fallback)
   const providers = [
-    { name: 'OpenAI', fn: callOpenAI, enabled: !!OPENAI_API_KEY },
-    { name: 'Gemini', fn: callGemini, enabled: !!GEMINI_API_KEY },
-    { name: 'Ollama', fn: callOllama, enabled: true }
+    { name: 'CLIProxyAPI', fn: callCLIProxy, enabled: true },  // Unified: OpenAI, Gemini, Claude
+    { name: 'Ollama', fn: callOllama, enabled: true }          // Local fallback
   ];
 
   for (const provider of providers) {
@@ -960,17 +1000,41 @@ async function generateAIResponse(userMessage, userLang, context = {}) {
     // 🆕 動態載入相關 knowledge base（根據問題內容）
     let additionalContext = '';
     const lowerMsg = userMessage.toLowerCase();
+    console.log('[DEBUG] generateAIResponse called, lowerMsg:', lowerMsg);
+    console.log('[DEBUG] Checking conditions: mouse=' + lowerMsg.includes('mouse') + ', 進度=' + lowerMsg.includes('進度'));
 
     // CES 相關問題 → 載入 customers + pmMemory
     if (lowerMsg.includes('ces') || lowerMsg.includes('展會') || lowerMsg.includes('展位')) {
+      console.log('[DEBUG] Matched: CES branch');
       const customersInfo = knowledgeBase.customers ? knowledgeBase.customers.substring(0, 2500) : '';
       const pmInfo = knowledgeBase.pmMemory ? knowledgeBase.pmMemory.substring(0, 2500) : '';
       additionalContext += `\n\n📅 CES 2026 相關資訊:\n展位: Venetian #60837\n日期: 2026-01-07~10\n\nCustomer Pipeline:\n${customersInfo}\n\nPM Memory:\n${pmInfo}`;
     }
-    // OEM/客戶相關問題 → 載入 customers
+    // OEM/客戶相關問題 → 載入 customers + pmMemory（因為客戶進度可能在 pmMemory）
     else if (lowerMsg.includes('oem') || lowerMsg.includes('客戶') || lowerMsg.includes('asus') || lowerMsg.includes('hp') || lowerMsg.includes('lenovo') || lowerMsg.includes('gigabyte') || lowerMsg.includes('mouse')) {
-      const customersInfo = knowledgeBase.customers ? knowledgeBase.customers.substring(0, 3000) : '';
-      additionalContext += `\n\nCustomer Pipeline:\n${customersInfo}`;
+      console.log('[DEBUG] Matched: OEM/Customer branch (mouse detected)');
+      const customersInfo = knowledgeBase.customers ? knowledgeBase.customers.substring(0, 2500) : '';
+      // 智能提取：找出與查詢相關的 pmMemory 段落
+      let pmInfo = '';
+      if (knowledgeBase.pmMemory) {
+        // 提取關係圖譜 section（包含客戶最新狀態）
+        const relationshipMatch = knowledgeBase.pmMemory.match(/## 🔗 關係圖譜[\s\S]*?(?=\n## |$)/);
+        // 提取時間軸 section（包含會議進度）
+        const timelineMatch = knowledgeBase.pmMemory.match(/## 📅 重要時間軸[\s\S]*?(?=\n## |$)/);
+        // 提取記憶更新紀錄（最新更新）
+        const memoryLogMatch = knowledgeBase.pmMemory.match(/## 🔄 記憶更新紀錄[\s\S]*?(?=\n## |$)/);
+
+        if (relationshipMatch) pmInfo += relationshipMatch[0].substring(0, 2000) + '\n';
+        if (timelineMatch) pmInfo += timelineMatch[0].substring(0, 1500) + '\n';
+        if (memoryLogMatch) pmInfo += memoryLogMatch[0].substring(0, 1000);
+
+        // 如果沒匹配到，fallback 到原本的方式
+        if (!pmInfo) pmInfo = knowledgeBase.pmMemory.substring(0, 2500);
+      }
+      additionalContext += `\n\nCustomer Pipeline:\n${customersInfo}\n\nPM Memory (客戶進度更新):\n${pmInfo}`;
+      console.log('[DEBUG] OEM/Customer query detected, pmInfo length:', pmInfo.length);
+      console.log('[DEBUG] pmInfo contains Mouse Computer:', pmInfo.includes('Mouse Computer'));
+      console.log('[DEBUG] pmInfo contains Trial Request:', pmInfo.includes('Trial Request'));
     }
     // 進度/狀態相關問題 → 載入 pmMemory
     else if (lowerMsg.includes('進度') || lowerMsg.includes('狀態') || lowerMsg.includes('status') || lowerMsg.includes('progress')) {
@@ -2562,6 +2626,42 @@ function buildHomeView() {
 
   blocks.push({ type: "divider" });
 
+  // Knowledge Base Manager Section
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: "*📚 IrisGo PM Knowledge Base*" }
+  });
+
+  // Get pending updates count
+  const pendingUpdates = kbSubmit.loadPendingUpdates();
+  const pendingCount = pendingUpdates.length;
+
+  blocks.push({
+    type: "context",
+    elements: [
+      { type: "mrkdwn", text: `📊 Status: 18 docs | Last sync: ${knowledgeBase.lastUpdated || 'N/A'} | NotebookLM: ✅` }
+    ]
+  });
+
+  blocks.push({
+    type: "actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "📤 Submit Update", emoji: true },
+        action_id: "kb_submit_update"
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: `⏳ Pending Review (${pendingCount})`, emoji: true },
+        action_id: "kb_view_pending",
+        style: pendingCount > 0 ? "primary" : undefined
+      }
+    ]
+  });
+
+  blocks.push({ type: "divider" });
+
   // Footer Tips
   blocks.push({
     type: "context",
@@ -2989,6 +3089,32 @@ app.action('home_book_meeting', async ({ ack }) => {
   console.log('[App Home] User clicked book meeting button');
 });
 
+// ============ KNOWLEDGE BASE MANAGER ACTIONS ============
+
+// Submit Update
+app.action('kb_submit_update', kbSubmit.handleSubmitClick);
+
+// Submit Modal Submission
+app.view('kb_submit_modal', kbSubmit.handleSubmitModalSubmission);
+
+// View Pending Reviews
+app.action('kb_view_pending', kbReview.handlePendingReviewClick);
+
+// Review Individual Update
+app.action(/^kb_review_/, kbReview.handleReviewClick);
+
+// Approve Update
+app.action(/^kb_approve_/, kbReview.handleApprove);
+
+// Edit Update
+app.action(/^kb_edit_/, kbReview.handleEdit);
+
+// Edit Modal Submission
+app.view(/^kb_edit_modal_/, kbReview.handleEditSubmission);
+
+// Reject Update
+app.action(/^kb_reject_/, kbReview.handleReject);
+
 // ============ STARTUP ============
 
 (async () => {
@@ -3002,6 +3128,33 @@ app.action('home_book_meeting', async ({ ack }) => {
     console.log(`📡 Full Name: ${process.env.BOT_FULL_NAME || 'Knight Industries Team Tool'}`);
     console.log(`🌐 Default Language: ${process.env.DEFAULT_LANGUAGE || 'zh-TW'}`);
     console.log(`🔌 Port: ${process.env.PORT || 3000}`);
+
+    // Initialize Heartbeat System
+    if (process.env.HEARTBEAT_ENABLED === 'true') {
+      const heartbeat = new Heartbeat({
+        agentId: 'kitt',
+        workspaceId: process.env.WORKSPACE_ID || 'default',
+        channel: process.env.HEARTBEAT_CHANNEL,
+        slackClient: app.client,
+        interval: parseInt(process.env.HEARTBEAT_INTERVAL) || 30 * 60 * 1000,
+        persona: `You are KITT (Knight Industries Team Tool), IrisGo's PM assistant.
+Your responsibilities include tracking product priorities, managing updates, and helping the team stay organized.
+You have access to the IrisGo knowledge base and can help with product-related questions.`
+      });
+      heartbeat.start();
+      console.log(`🫀 Heartbeat: Enabled (every ${Math.round(heartbeat.interval / 60000)} min)`);
+
+      // Graceful shutdown
+      process.on('SIGTERM', () => {
+        heartbeat.stop();
+      });
+      process.on('SIGINT', () => {
+        heartbeat.stop();
+      });
+    } else {
+      console.log('🫀 Heartbeat: Disabled (set HEARTBEAT_ENABLED=true to enable)');
+    }
+
     console.log('');
     console.log('💬 Ready to assist your team!');
   } catch (error) {
