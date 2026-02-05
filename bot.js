@@ -18,6 +18,7 @@ const path = require('path');
 const { initDB, getStats: getDBStats } = require('./storage/database');
 const { addMessage, getHistory, clearHistory, formatForPrompt, cleanupExpired } = require('./storage/conversations');
 const { createUpdate, getUpdate, getPendingUpdates, getAllUpdates, updateStatus, editUpdate } = require('./storage/updates');
+const { formatForSlack } = require('./utils/slack-format');
 
 // Long-term Memory System (shared via Dropbox)
 const {
@@ -573,6 +574,7 @@ function hasRelayTrigger(text) {
   const triggers = [
     /幫我(轉達|傳達|告訴|跟).*(Lman|老闆|boss)/i,
     /跟(Lman|老闆|boss)說/i,
+    /和.*(Lman|老闆|boss).*說/i,  // 和Lman說、和老闆說
     /(轉達|傳達|告訴|通知).*(Lman|老闆|boss)/i,
     /tell\s+(Lman|the\s+boss)/i,
     /message\s+for\s+(Lman|the\s+boss)/i,
@@ -592,6 +594,7 @@ function extractRelayMessage(text) {
     .replace(/<@[A-Z0-9]+>/g, '') // Remove @mentions
     .replace(/幫我(轉達|傳達|告訴|跟).*(Lman|老闆|boss)[，,：:]*\s*/gi, '')
     .replace(/跟(Lman|老闆|boss)說[，,：:]*\s*/gi, '')
+    .replace(/和.*(Lman|老闆|boss).*說[，,：:]*\s*/gi, '')  // 和Lman說、和老闆說
     .replace(/(轉達|傳達|告訴|通知).*(Lman|老闆|boss)[，,：:]*\s*/gi, '')
     .replace(/tell\s+(Lman|the\s+boss)[,:\s]*/gi, '')
     .replace(/message\s+for\s+(Lman|the\s+boss)[,:\s]*/gi, '')
@@ -2441,7 +2444,7 @@ app.event('message', async ({ event, say, client }) => {
         // Save KITT response to conversation history
         addMessage(event.user, 'assistant', response);
 
-        await say(response);
+        await say(formatForSlack(response));
         console.log(`[DEBUG] Response sent via say()`);
       }
     } else {
