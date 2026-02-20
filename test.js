@@ -19,6 +19,34 @@ try {
   process.exit(1);
 }
 
+// Test 0.1: Run Skills Discovery and Registration tests
+try {
+  const { runDiscoveryTests } = require('./test/skills/registry-discovery.test.js');
+  const discoveryTestsPass = runDiscoveryTests();
+  if (!discoveryTestsPass) {
+    console.error('❌ Skills Discovery tests failed');
+    process.exit(1);
+  }
+  console.log(''); // Add spacing
+} catch (error) {
+  console.error('❌ Skills Discovery tests failed to run:', error.message);
+  process.exit(1);
+}
+
+// Test 0.2: Run Type Check tests
+try {
+  const { runTypeCheckTests } = require('./test/type-check.js');
+  const typeCheckPass = runTypeCheckTests();
+  if (!typeCheckPass) {
+    console.error('❌ Type check tests failed');
+    process.exit(1);
+  }
+  console.log(''); // Add spacing
+} catch (error) {
+  console.error('❌ Type check tests failed to run:', error.message);
+  process.exit(1);
+}
+
 // Test 1: Check if main bot file exists and is valid JS
 try {
   require('./bot.js');

@@ -871,6 +871,8 @@ async function callOllama(prompt, maxTokens = 300) {
  * Call CLIProxyAPI (OAuth-based Gemini/Claude access, bypasses API quotas)
  */
 async function callCLIProxy(prompt, maxTokens = 300) {
+  // GLM is a reasoning model: needs ≥4096 tokens to complete reasoning + output content
+  const effectiveMaxTokens = CLIPROXY_MODEL.startsWith('glm') ? Math.max(maxTokens, 4096) : maxTokens;
   const response = await fetch(`${CLIPROXY_URL}/v1/chat/completions`, {
     method: 'POST',
     headers: {
@@ -881,7 +883,7 @@ async function callCLIProxy(prompt, maxTokens = 300) {
       model: CLIPROXY_MODEL,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.3,
-      max_tokens: maxTokens
+      max_tokens: effectiveMaxTokens
     })
   });
 
@@ -890,7 +892,8 @@ async function callCLIProxy(prompt, maxTokens = 300) {
   }
 
   const data = await response.json();
-  return data.choices?.[0]?.message?.content?.trim() || '';
+  const msg = data.choices?.[0]?.message;
+  return (msg?.content || msg?.reasoning_content || '').trim();
 }
 
 /**
